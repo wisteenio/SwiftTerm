@@ -124,9 +124,20 @@ enum TerminalCheckpointActiveBuffer: String, Codable, Sendable {
 /// `lines` 的下标是 checkpoint 内相对行号；normal 可以是 `[history..., viewport...]`，alternate
 /// 必须只含 viewport。`yBase` 指向 viewport 顶行，`yDisplay` 指向用户当前看到的顶行，二者都
 /// 相对 `lines[0]`；`linesTrimmed` 是 engine 自创建以来已从顶部淘汰的单调计数，不参与寻址。
-/// `x/y` 与 `savedX/savedY` 均为 viewport 内 0-based cursor，其中 x 可以等于 columns 表示
-/// autowrap pending。所有坐标在构造 live `Buffer` 前整体校验，不能边写 live state 边修正。
+/// `x/y` 是 viewport 内 0-based cursor，其中 x 可以等于 columns 表示 autowrap pending。
+/// `savedX` 具有同样的横向范围；`savedY` 则是 SwiftTerm resize/reflow 保留的 deferred DECRC
+/// 坐标，可能暂时位于 viewport 外，只有真正 restore 时才 clamp。checkpoint 必须原样保存它，
+/// 否则恢复后再 resize/DECRC 会改变行为。V1 只接受 Int32 serialized domain：这不是 viewport
+/// clamp，而是不可信输入的算术边界；若允许任意 Int，Buffer 会在 resize/reflow 内部运算时溢出。
+/// 其余坐标在构造 live `Buffer` 前整体校验，不能边写 live state 边修正。
 struct TerminalCheckpointBufferV1: Codable, Sendable {
+    /// 固定宽度避免 schema 的安全边界随 host word size 漂移。AirCLI geometry 是 UInt16，V1 又把
+    /// viewport/history 限到 1,000/2,000 行，因此 Int32 足以承载当前 production deferred
+    /// cursor，并在 64-bit runtime 上为 resize/reflow 留出数个数量级的 Int 运算余量。若 live
+    /// engine 理论上累积越界，export 必须 fail closed，不能 clamp。未来扩大此域前，必须先把
+    /// normal/alternate Buffer 内全部 savedY 加减法改成 total arithmetic，禁止只放宽此 guard。
+    private static let deferredSavedCursorYRange = Int(Int32.min)...Int(Int32.max)
+
     var lines: [TerminalCheckpointLineV1]
     var scrollbackLimit: Int?
     var x: Int
@@ -200,7 +211,8 @@ struct TerminalCheckpointBufferV1: Codable, Sendable {
         guard tabStops.count == columns else {
             throw TerminalCheckpointError.invalidStructure("tab-stops")
         }
-        guard savedX >= 0, savedX <= columns, (0..<rows).contains(savedY) else {
+        guard savedX >= 0, savedX <= columns,
+              Self.deferredSavedCursorYRange.contains(savedY) else {
             throw TerminalCheckpointError.invalidStructure("saved-cursor")
         }
         try savedPen.validate()

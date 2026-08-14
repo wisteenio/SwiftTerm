@@ -916,14 +916,18 @@ open class Terminal {
     }
     
     func resizeBuffers(newColumns: Int, newRows: Int) {
-        // correct the savedY cursor to follow changes to y
-        let dy = normalBuffer.savedY - normalBuffer.y
+        // `savedY` 是延迟到 DECRC 才消费的 engine state；resize 必须保留它与 live cursor 的
+        // 相对距离，不能在这里提前 clamp 到 viewport。Checkpoint V1 在 import 前把不可信值
+        // 限定为 Int32，既覆盖 production geometry，也为下面及 Buffer reflow 的 Int 运算保留
+        // 充足余量；不要在此另建一套 fork-only 的饱和或钳制语义。
+        let savedCursorYOffset = normalBuffer.savedY - normalBuffer.y
         normalBuffer.resize (newCols: newColumns, newRows: newRows)
-        normalBuffer.savedY = normalBuffer.y + dy
+        normalBuffer.savedY = normalBuffer.y + savedCursorYOffset
         
         altBuffer.resize (newCols: newColumns, newRows: newRows)
 
     }
+
     public func setup (isReset: Bool = false)
     {
         // Sadly a duplicate of much of what lives in init() due to Swift not allowing me to

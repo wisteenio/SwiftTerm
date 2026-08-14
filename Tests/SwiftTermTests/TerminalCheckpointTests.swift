@@ -167,6 +167,57 @@ final class TerminalCheckpointTests {
         )) {
             try TerminalCheckpoint(encodedBytes: oversized)
         }
+
+        // savedY 是 resize/reflow 后延迟到 DECRC 才 clamp 的 engine state，不能套用 viewport
+        // invariant；但 checkpoint 是不可信输入，V1 只接受固定 Int32 domain。Int 极值必须在
+        // candidate/live Buffer 建立前拒绝，否则 normal/alternate 的内部 reflow 算术都可能 trap。
+        for bufferKey in ["normal", "alternate"] {
+            for savedY in [Int.min, Int.max] {
+                var invalidSavedCursor = try #require(
+                    JSONSerialization.jsonObject(with: checkpoint.encodedBytes())
+                        as? [String: Any]
+                )
+                var buffer = try #require(invalidSavedCursor[bufferKey] as? [String: Any])
+                buffer["savedY"] = savedY
+                invalidSavedCursor[bufferKey] = buffer
+                let bytes = try JSONSerialization.data(withJSONObject: invalidSavedCursor)
+                #expect(throws: TerminalCheckpointError.invalidStructure("saved-cursor")) {
+                    try TerminalCheckpoint(encodedBytes: bytes)
+                }
+            }
+        }
+
+        // 使用带 history 且 current y > 0 的 normal buffer，再激活 alternate；随后同时恢复两个
+        // buffer 的 Int32 endpoint 并改变 columns/rows。这样 normal 会实际经过 reflow，active
+        // alternate 会执行 DECRC，证明 serialized bound 既保留 deferred state 又不引入溢出。
+        let (extremeSource, _) = TerminalTestHarness.makeTerminal(
+            cols: 8, rows: 3, scrollback: 8)
+        for line in 0..<6 {
+            extremeSource.feed(text: "line-\(line)\r\n")
+        }
+        #expect(extremeSource.normalBuffer.y > 0)
+        #expect(extremeSource.normalBuffer.yBase > 0)
+        extremeSource.feed(text: "\(esc)[?1049h\(esc)[3;1H")
+        let extremeBase = try extremeSource.exportCheckpoint()
+
+        for (savedY, expectedY) in [(Int(Int32.min), 0), (Int(Int32.max), 3)] {
+            var extreme = try #require(
+                JSONSerialization.jsonObject(with: extremeBase.encodedBytes()) as? [String: Any]
+            )
+            for bufferKey in ["normal", "alternate"] {
+                var buffer = try #require(extreme[bufferKey] as? [String: Any])
+                buffer["savedY"] = savedY
+                extreme[bufferKey] = buffer
+            }
+            let bytes = try JSONSerialization.data(withJSONObject: extreme)
+            let extremeCheckpoint = try TerminalCheckpoint(encodedBytes: bytes)
+            let (extremeTerminal, _) = TerminalTestHarness.makeTerminal(
+                cols: 2, rows: 1, scrollback: 0)
+            try extremeTerminal.importCheckpoint(extremeCheckpoint)
+            extremeTerminal.resize(cols: 5, rows: 4)
+            extremeTerminal.feed(text: "\(esc)8")
+            #expect(extremeTerminal.buffer.y == expectedY)
+        }
     }
 
     /// resize 是 owner 串行队列上的离散事件；checkpoint 不捕获“半次 resize”，但必须完整
@@ -177,6 +228,9 @@ final class TerminalCheckpointTests {
         source.resize(cols: 11, rows: 7)
         source.resize(cols: 26, rows: 4)
         source.resize(cols: 14, rows: 6)
+        source.feed(text: "\(esc)[6;1H\(esc)7\(esc)[4;1H")
+        source.resize(cols: 14, rows: 4)
+        #expect(source.normalBuffer.savedY >= source.rows)
 
         let checkpoint = try source.exportCheckpoint()
         let (restored, restoredDelegate) = TerminalTestHarness.makeTerminal(cols: 3, rows: 2, scrollback: 0)
@@ -185,11 +239,40 @@ final class TerminalCheckpointTests {
 
         sourceDelegate.clearSentData()
         restoredDelegate.clearSentData()
-        let suffix = Array("\r\nafter-resize\t界".utf8)
+        let suffix = Array("\(esc)8\r\nafter-resize\t界".utf8)
         source.feed(buffer: suffix[...])
         restored.feed(buffer: suffix[...])
         assertEquivalentBehavior(source, restored)
         #expect(sourceDelegate.sentData == restoredDelegate.sentData)
+
+        // `savedY` 在缩小 viewport 后可以合法地落在可见行之外；checkpoint 必须保存 deferred
+        // 坐标，而不是在 export/import 时提前 clamp。重新放大后再执行 DECRC，才能把“原样保留”
+        // 与错误地钳制到旧 viewport 底行区分开。normal/alternate 共用同一 schema 合同，二者都要
+        // 经历这个行为验证，避免只修 production 常见的 normal buffer。
+        for usesAlternateBuffer in [false, true] {
+            let (deferredSource, _) = TerminalTestHarness.makeTerminal(
+                cols: 10, rows: 6, scrollback: 0)
+            if usesAlternateBuffer {
+                deferredSource.feed(text: "\(esc)[?1049h")
+            }
+            deferredSource.feed(text: "\(esc)[6;1H\(esc)7\(esc)[4;1H")
+            deferredSource.resize(cols: 10, rows: 4)
+            #expect(deferredSource.buffer.savedY == 5)
+
+            let deferredCheckpoint = try deferredSource.exportCheckpoint()
+            let (deferredRestored, _) = TerminalTestHarness.makeTerminal(
+                cols: 2, rows: 1, scrollback: 0)
+            try deferredRestored.importCheckpoint(deferredCheckpoint)
+            #expect(deferredRestored.buffer.savedY == 5)
+
+            deferredSource.resize(cols: 10, rows: 6)
+            deferredRestored.resize(cols: 10, rows: 6)
+            deferredSource.feed(text: "\(esc)8")
+            deferredRestored.feed(text: "\(esc)8")
+            #expect(deferredSource.buffer.y == 5)
+            #expect(deferredRestored.buffer.y == 5)
+            assertEquivalentBehavior(deferredSource, deferredRestored)
+        }
     }
 
     private func checkpointCorpusUnit() -> String {
@@ -257,6 +340,14 @@ final class TerminalCheckpointTests {
         #expect(lhs.marginLeft == rhs.marginLeft)
         #expect(lhs.marginRight == rhs.marginRight)
         #expect(Array(lhs.tabStops.prefix(lhs.cols)) == Array(rhs.tabStops.prefix(rhs.cols)))
+        #expect(lhs.savedX == rhs.savedX)
+        #expect(lhs.savedY == rhs.savedY)
+        #expect(lhs.savedAttr == rhs.savedAttr)
+        #expect(lhs.savedCharset == rhs.savedCharset)
+        #expect(lhs.savedOriginMode == rhs.savedOriginMode)
+        #expect(lhs.savedMarginMode == rhs.savedMarginMode)
+        #expect(lhs.savedWraparound == rhs.savedWraparound)
+        #expect(lhs.savedReverseWraparound == rhs.savedReverseWraparound)
         #expect(lhs.semanticContent == rhs.semanticContent)
         #expect(lhs.semanticInput == rhs.semanticInput)
         #expect(lhs.semanticClickMode == rhs.semanticClickMode)
