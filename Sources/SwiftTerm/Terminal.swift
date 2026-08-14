@@ -7897,6 +7897,587 @@ open class Terminal {
     }
 }
 
+private final class TerminalCheckpointCandidateDelegate: TerminalDelegate {
+    func send(source: Terminal, data: ArraySlice<UInt8>) {}
+}
+
+// Checkpoint engine implementation intentionally stays in Terminal.swift. It needs private Terminal
+// state to produce one coherent snapshot; widening those fields to internal/fileprivate for a separate
+// file would create exactly the private-field seam that AirCLI #125 forbids business code to depend on.
+extension Terminal {
+    /// 导出当前 engine 的结构化 checkpoint。调用者必须在拥有 Terminal 的串行执行上下文调用；
+    /// normal scrollback 会先按 2,000 个逻辑行和 2 MiB history payload 双上限裁剪，图片及
+    /// 无法稳定编码的非 String payload 明确返回 unsupported，不生成近似画面。
+    /// #57 必须在拥有 output offset 与该 Terminal 的同一串行 executor 中调用，并在返回后把
+    /// opaque bytes 与“已喂入 engine 的 absolute offset”一次绑定。SwiftTerm 不拥有 Session、
+    /// epoch、transport 或 transcript cursor，禁止在此扩展这些跨层状态。
+    public func exportCheckpoint(
+        isCancelled: () -> Bool = { false }
+    ) throws -> TerminalCheckpoint {
+        if isCancelled() { throw TerminalCheckpointError.cancelled }
+        // 图片 capability 不属于本 schema。不能只检查已经挂到 BufferLine 的 image：Kitty
+        // graphics 还可能停留在 cache、multipart upload 或 placement context 中；任何一种都
+        // 必须整体拒绝，避免恢复出“文字正确但图片静默丢失”的近似画面。
+        guard kittyGraphicsState.imagesById.isEmpty,
+              kittyGraphicsState.imageNumbers.isEmpty,
+              kittyGraphicsState.pending == nil,
+              kittyGraphicsState.placementsByKey.isEmpty,
+              kittyPlacementContext == nil,
+              !(parser.currentState == .apcString && parser._apc.first == UInt8(ascii: "G")) else {
+            throw TerminalCheckpointError.unsupportedContent("images")
+        }
+        let activeDCS: TerminalCheckpointDCSV1?
+        if let handler = parser.activeDcsHandler {
+            guard let decrqss = handler as? DECRQSS else {
+                throw TerminalCheckpointError.unsupportedContent("images-or-unknown-dcs-in-flight")
+            }
+            activeDCS = TerminalCheckpointDCSV1(kind: .decrqss, data: decrqss.data)
+        } else {
+            activeDCS = nil
+        }
+
+        var normal = try checkpointBuffer(normalBuffer, isNormal: true, isCancelled: isCancelled)
+        try trimNormalHistoryToByteLimit(&normal, isCancelled: isCancelled)
+        let alternate = try checkpointBuffer(altBuffer, isNormal: false, isCancelled: isCancelled)
+        let storage = TerminalCheckpointStorageV1(
+            version: TerminalCheckpoint.schemaVersion,
+            columns: cols,
+            rows: rows,
+            activeBuffer: isCurrentBufferAlternate ? .alternate : .normal,
+            normal: normal,
+            alternate: alternate,
+            modes: checkpointModes(),
+            palette: TerminalCheckpointPaletteV1(
+                strategy: TerminalCheckpointPaletteStrategyV1(strategy: options.ansi256PaletteStrategy),
+                installed: installedColors.map(TerminalCheckpointColorV1.init(color:)),
+                defaults: defaultAnsiColors.map(TerminalCheckpointColorV1.init(color:)),
+                active: ansiColors.map(TerminalCheckpointColorV1.init(color:)),
+                foreground: TerminalCheckpointColorV1(color: foregroundColor),
+                background: TerminalCheckpointColorV1(color: backgroundColor),
+                cursor: cursorColor.map(TerminalCheckpointColorV1.init(color:))
+            ),
+            parser: TerminalCheckpointParserV1(
+                initialState: parser.initialState.rawValue,
+                currentState: parser.currentState.rawValue,
+                osc: parser._osc,
+                apc: parser._apc,
+                parameters: parser._pars,
+                parameterText: parser._parsTxt,
+                collect: parser._collect,
+                parameterLimitExceeded: parser._parameterLimitExceeded,
+                pendingUTF8: readingBuffer.putbackBuffer,
+                activeDCS: activeDCS
+            )
+        )
+        if isCancelled() { throw TerminalCheckpointError.cancelled }
+        return try TerminalCheckpoint(storage: storage)
+    }
+
+    /// 原子导入 `TerminalCheckpoint`。
+    ///
+    /// 状态转换只有 `validating -> ready(candidate) -> committed`：decode/validation 已由 envelope
+    /// 完成，本方法把所有 cell、Buffer 与 mode 构造到隔离 candidate，并在 cancellation gate 后
+    /// 进入不返回业务错误的 commit 区段。任何 validation、allocation、unsupported content 或
+    /// cancel 都只销毁 candidate，live Terminal 保持逐字段不变；进入 commit 后不再检查 cancel。
+    ///
+    /// #57 的 consumer 必须先停止向同一个 Terminal 喂增量 output，在其唯一串行 owner 上调用本
+    /// 方法，成功返回后才从 checkpoint offset 之后继续 feed。import 会采用 checkpoint 的 grid
+    /// dimensions，但不会发送 `sizeChanged`：恢复既有 Host geometry 不是 Mobile 发起新的 PTY
+    /// resize。所有 delegate 通知都发生在完整 commit 之后，因此 renderer 看不到半恢复状态。
+    ///
+    /// 后续 schema 扩展必须沿固定顺序增加：V1 DTO + `validate` -> candidate 构造 -> 此处唯一 commit
+    /// -> fixed/random cut Gate；禁止在 decode/validation 阶段直接写 live Terminal。
+    public func importCheckpoint(
+        _ checkpoint: TerminalCheckpoint,
+        isCancelled: () -> Bool = { false }
+    ) throws {
+        if isCancelled() { throw TerminalCheckpointError.cancelled }
+
+        let storage = checkpoint.storage
+        let candidateDelegate = TerminalCheckpointCandidateDelegate()
+        var candidateOptions = options
+        candidateOptions.cols = storage.columns
+        candidateOptions.rows = storage.rows
+        candidateOptions.scrollback = storage.normal.scrollbackLimit ?? 0
+        let candidate = Terminal(delegate: candidateDelegate, options: candidateOptions)
+        try candidate.prepareCheckpointCandidate(storage, isCancelled: isCancelled)
+
+        if isCancelled() { throw TerminalCheckpointError.cancelled }
+        commitCheckpointCandidate(candidate, storage: storage)
+    }
+
+    private func checkpointBuffer(
+        _ source: Buffer,
+        isNormal: Bool,
+        isCancelled: () -> Bool
+    ) throws -> TerminalCheckpointBufferV1 {
+        guard !source.hasAnyImages else {
+            throw TerminalCheckpointError.unsupportedContent("images")
+        }
+        let maximumHistory = isNormal ? TerminalCheckpoint.maximumNormalScrollbackLines : 0
+        let retainedCount = min(source.lines.count, rows + maximumHistory)
+        let firstRetained = source.lines.count - retainedCount
+        var lineRecords: [TerminalCheckpointLineV1] = []
+        lineRecords.reserveCapacity(retainedCount)
+        for index in firstRetained..<source.lines.count {
+            if isCancelled() { throw TerminalCheckpointError.cancelled }
+            let line = source.lines[index]
+            var cells: [TerminalCheckpointCellV1] = []
+            cells.reserveCapacity(cols)
+            for column in 0..<cols {
+                let cell = line[column]
+                let payload: String?
+                if let target = cell.getPayload() {
+                    guard let string = target as? String else {
+                        throw TerminalCheckpointError.unsupportedContent("non-string-cell-payload")
+                    }
+                    payload = string
+                } else {
+                    payload = nil
+                }
+                cells.append(TerminalCheckpointCellV1(
+                    character: cell.code == 0 ? nil : String(getCharacter(for: cell)),
+                    width: Int(cell.width),
+                    attribute: TerminalCheckpointAttributeV1(attribute: cell.attribute),
+                    stringPayload: payload,
+                    semanticContent: TerminalCheckpointSemanticContent(content: cell.semanticContent)
+                ))
+            }
+            lineRecords.append(TerminalCheckpointLineV1(
+                cells: cells,
+                isWrapped: line.isWrapped,
+                renderMode: TerminalCheckpointRenderMode(mode: line.renderMode),
+                bidi: TerminalCheckpointBidiV1(state: line.bidiState),
+                semanticMarks: line.semanticMarks.map {
+                    TerminalCheckpointSemanticMarkV1(
+                        kind: TerminalCheckpointSemanticMarkKindV1(kind: $0.kind),
+                        column: $0.column,
+                        group: $0.group
+                    )
+                },
+                semanticHardContinuationGroup: line.semanticHardContinuationGroup
+            ))
+        }
+        while lineRecords.count < rows {
+            let blank = TerminalCheckpointCellV1(
+                character: nil,
+                width: 1,
+                attribute: TerminalCheckpointAttributeV1(attribute: CharData.defaultAttr),
+                stringPayload: nil,
+                semanticContent: .none
+            )
+            lineRecords.append(TerminalCheckpointLineV1(
+                cells: Array(repeating: blank, count: cols),
+                isWrapped: false,
+                renderMode: .single,
+                bidi: TerminalCheckpointBidiV1(state: source.defaultBidiState),
+                semanticMarks: [],
+                semanticHardContinuationGroup: nil
+            ))
+        }
+
+        let historyCount = max(0, lineRecords.count - rows)
+        return TerminalCheckpointBufferV1(
+            lines: lineRecords,
+            scrollbackLimit: isNormal ? max(historyCount, min(source.scrollback ?? 0, maximumHistory)) : nil,
+            x: source.x,
+            y: source.y,
+            yBase: source.yBase - firstRetained,
+            yDisplay: max(0, source.yDisp - firstRetained),
+            linesTrimmed: source.linesTop + firstRetained,
+            scrollTop: source.scrollTop,
+            scrollBottom: source.scrollBottom,
+            marginLeft: source.marginLeft,
+            marginRight: source.marginRight,
+            // SwiftTerm 的历史 resize path 可能保留 viewport 之外的 stale slots；它们不属于
+            // terminal state，checkpoint 只编码当前 grid 可寻址的 columns。
+            tabStops: Array(source.tabStops.prefix(cols)),
+            savedX: source.savedX,
+            savedY: source.savedY,
+            savedPen: TerminalCheckpointPenV1(
+                attribute: TerminalCheckpointAttributeV1(attribute: source.savedAttr),
+                charset: source.savedCharset
+            ),
+            savedOriginMode: source.savedOriginMode,
+            savedMarginMode: source.savedMarginMode,
+            savedWraparound: source.savedWraparound,
+            savedReverseWraparound: source.savedReverseWraparound,
+            semantic: source.checkpointSemanticState(firstRetainedLine: firstRetained)
+        )
+    }
+
+    private func trimNormalHistoryToByteLimit(
+        _ record: inout TerminalCheckpointBufferV1,
+        isCancelled: () -> Bool
+    ) throws {
+        let encoder = JSONEncoder()
+        let historyCount = max(0, record.lines.count - rows)
+        var retainedHistoryCount = 0
+        var retainedHistoryBytes = 2 // JSON array 的 `[]`。
+
+        // 产品合同保留“最新 history 后缀”。从末尾只编码每行一次，累加逗号与数组括号后
+        // 即得到与整段 JSON array 相同的 byte 上限，避免逐行 remove + 全量重编码的 O(n²)。
+        for line in record.lines.prefix(historyCount).reversed() {
+            if isCancelled() { throw TerminalCheckpointError.cancelled }
+            guard let encodedLine = try? encoder.encode(line) else { break }
+            let separatorBytes = retainedHistoryCount == 0 ? 0 : 1
+            guard retainedHistoryBytes + separatorBytes + encodedLine.count
+                    <= TerminalCheckpoint.maximumNormalScrollbackBytes else {
+                break
+            }
+            retainedHistoryBytes += separatorBytes + encodedLine.count
+            retainedHistoryCount += 1
+        }
+
+        let removedCount = historyCount - retainedHistoryCount
+        if removedCount > 0 {
+            record.lines.removeFirst(removedCount)
+            record.yBase -= removedCount
+            record.yDisplay = max(0, record.yDisplay - removedCount)
+            record.linesTrimmed += removedCount
+            if let promptRow = record.semantic.promptStartRow {
+                record.semantic.promptStartRow = promptRow >= removedCount
+                    ? promptRow - removedCount
+                    : nil
+            }
+        }
+    }
+
+    private func checkpointModes() -> TerminalCheckpointModesV1 {
+        TerminalCheckpointModesV1(
+            applicationKeypad: applicationKeypad,
+            applicationCursor: applicationCursor,
+            keyboardNormalFlags: keyboardModeNormal.flags.rawValue,
+            keyboardNormalStack: keyboardModeNormal.stack.map(\.rawValue),
+            keyboardAlternateFlags: keyboardModeAlt.flags.rawValue,
+            keyboardAlternateStack: keyboardModeAlt.stack.map(\.rawValue),
+            sendFocus: sendFocus,
+            synchronizedOutput: synchronizedOutputActive,
+            cursorHidden: cursorHidden,
+            cursorBlink: cursorBlink,
+            cursorStyle: TerminalCheckpointCursorStyleV1(style: options.cursorStyle),
+            origin: originMode,
+            margins: marginMode,
+            insert: insertMode,
+            wraparound: wraparound,
+            reverseWraparound: reverseWraparound,
+            bracketedPaste: bracketedPasteMode,
+            lineFeed: lineFeedMode,
+            smoothScroll: smoothScroll,
+            send8BitControls: cc.send8bit,
+            terminalConformance: TerminalCheckpointConformanceV1(conformance: conformance),
+            xtermTitleSetUTF: xtermTitleSetUtf,
+            xtermTitleSetHex: xtermTitleSetHex,
+            xtermTitleQueryUTF: xtermTitleQueryUtf,
+            xtermTitleQueryHex: xtermTitleQueryHex,
+            mouseMode: TerminalCheckpointMouseModeV1(mode: mouseMode),
+            mouseProtocol: TerminalCheckpointMouseProtocolV1(protocol: mouseProtocol),
+            mouseShiftCapture: mouseShiftCapture,
+            activeHyperlink: hyperLinkTracking.map {
+                TerminalCheckpointHyperlinkV1(
+                    column: $0.start.col,
+                    row: $0.start.row,
+                    payload: $0.payload
+                )
+            },
+            currentPen: TerminalCheckpointPenV1(
+                attribute: TerminalCheckpointAttributeV1(attribute: curAttr),
+                charset: charset
+            ),
+            charsets: gCharsets,
+            activeCharset: gcharset,
+            charsetLevel: gLevel,
+            bidi: TerminalCheckpointBidiV1(state: currentBidiState),
+            bidiArrowKeySwap: bidiArrowKeySwap,
+            allow80To132: allow80To132,
+            savedBidiPrivateModes: savedBidiPrivateModes
+        )
+    }
+
+    private func prepareCheckpointCandidate(
+        _ storage: TerminalCheckpointStorageV1,
+        isCancelled: () -> Bool
+    ) throws {
+        let bidiState = storage.modes.bidi.state
+        normalBuffer = try checkpointBufferCandidate(
+            storage.normal,
+            storage: storage,
+            bidiState: bidiState,
+            isCancelled: isCancelled
+        )
+        altBuffer = try checkpointBufferCandidate(
+            storage.alternate,
+            storage: storage,
+            bidiState: bidiState,
+            isCancelled: isCancelled
+        )
+        buffer = storage.activeBuffer == .normal ? normalBuffer : altBuffer
+        normalBuffer.scroll = { [weak self] wrapped in self?.scroll(isWrapped: wrapped) }
+        altBuffer.scroll = { [weak self] wrapped in self?.scroll(isWrapped: wrapped) }
+
+        let mode = storage.modes
+        applicationKeypad = mode.applicationKeypad
+        applicationCursor = mode.applicationCursor
+        keyboardModeNormal = KeyboardModeState(
+            flags: KittyKeyboardFlags(rawValue: mode.keyboardNormalFlags),
+            stack: mode.keyboardNormalStack.map(KittyKeyboardFlags.init(rawValue:))
+        )
+        keyboardModeAlt = KeyboardModeState(
+            flags: KittyKeyboardFlags(rawValue: mode.keyboardAlternateFlags),
+            stack: mode.keyboardAlternateStack.map(KittyKeyboardFlags.init(rawValue:))
+        )
+        sendFocus = mode.sendFocus
+        cursorHidden = mode.cursorHidden
+        cursorBlink = mode.cursorBlink
+        options.cursorStyle = mode.cursorStyle.style
+        originMode = mode.origin
+        setMarginMode(mode.margins)
+        setInsertMode(mode.insert)
+        setWraparound(mode.wraparound)
+        reverseWraparound = mode.reverseWraparound
+        bracketedPasteMode = mode.bracketedPaste
+        lineFeedMode = mode.lineFeed
+        smoothScroll = mode.smoothScroll
+        cc.send8bit = mode.send8BitControls
+        conformance = mode.terminalConformance.conformance
+        xtermTitleSetUtf = mode.xtermTitleSetUTF
+        xtermTitleSetHex = mode.xtermTitleSetHex
+        xtermTitleQueryUtf = mode.xtermTitleQueryUTF
+        xtermTitleQueryHex = mode.xtermTitleQueryHex
+        mouseMode = mode.mouseMode.mode
+        mouseProtocol = mode.mouseProtocol.protocol
+        mouseShiftCapture = mode.mouseShiftCapture
+        hyperLinkTracking = mode.activeHyperlink.map {
+            (start: Position(col: $0.column, row: $0.row), payload: $0.payload)
+        }
+        curAttr = mode.currentPen.attribute.attribute
+        charset = mode.currentPen.charset
+        gCharsets = mode.charsets
+        gcharset = mode.activeCharset
+        gLevel = mode.charsetLevel
+        currentBidiState = bidiState
+        bidiArrowKeySwap = mode.bidiArrowKeySwap
+        allow80To132 = mode.allow80To132
+        savedBidiPrivateModes = mode.savedBidiPrivateModes
+
+        let palette = storage.palette
+        options.ansi256PaletteStrategy = palette.strategy.strategy
+        foregroundColor = palette.foreground.color
+        backgroundColor = palette.background.color
+        cursorColor = palette.cursor?.color
+        installedColors = palette.installed.map(\.color)
+        defaultAnsiColors = palette.defaults.map(\.color)
+        ansiColors = palette.active.map(\.color)
+
+        parser.initialState = ParserState(rawValue: storage.parser.initialState)!
+        parser.currentState = ParserState(rawValue: storage.parser.currentState)!
+        parser._osc = storage.parser.osc
+        parser._apc = storage.parser.apc
+        parser._pars = storage.parser.parameters
+        parser._parsTxt = storage.parser.parameterText
+        parser._collect = storage.parser.collect
+        parser._parameterLimitExceeded = storage.parser.parameterLimitExceeded
+        if let dcs = storage.parser.activeDCS {
+            let handler = DECRQSS(terminal: self)
+            handler.data = dcs.data
+            parser.activeDcsHandler = handler
+        } else {
+            parser.activeDcsHandler = nil
+        }
+        readingBuffer.putbackBuffer = storage.parser.pendingUTF8
+        readingBuffer.rest = [][...]
+        readingBuffer.idx = 0
+        readingBuffer.count = storage.parser.pendingUTF8.count
+    }
+
+    private func checkpointBufferCandidate(
+        _ record: TerminalCheckpointBufferV1,
+        storage: TerminalCheckpointStorageV1,
+        bidiState: BidiPresentationState,
+        isCancelled: () -> Bool
+    ) throws -> Buffer {
+        var restoredLines: [BufferLine] = []
+        restoredLines.reserveCapacity(record.lines.count)
+        for lineRecord in record.lines {
+            if isCancelled() { throw TerminalCheckpointError.cancelled }
+            let line = BufferLine(
+                cols: storage.columns,
+                isWrapped: lineRecord.isWrapped,
+                bidiState: lineRecord.bidi.state
+            )
+            line.renderMode = lineRecord.renderMode.mode
+            line.semanticHardContinuationGroup = lineRecord.semanticHardContinuationGroup
+            for mark in lineRecord.semanticMarks {
+                line.setSemanticMark(kind: mark.kind.kind, column: mark.column, group: mark.group)
+            }
+            for (column, cellRecord) in lineRecord.cells.enumerated() {
+                let cell: CharData
+                if let encodedCharacter = cellRecord.character,
+                   let character = encodedCharacter.first {
+                    cell = makeCharData(
+                        attribute: cellRecord.attribute.attribute,
+                        char: character,
+                        size: Int8(cellRecord.width)
+                    )
+                } else {
+                    cell = makeCharData(
+                        attribute: cellRecord.attribute.attribute,
+                        code: 0,
+                        size: Int8(cellRecord.width)
+                    )
+                }
+                var restoredCell = cell
+                if let payload = cellRecord.stringPayload {
+                    guard let atom = makePayload(value: payload) else {
+                        throw TerminalCheckpointError.unsupportedContent("payload-capacity")
+                    }
+                    restoredCell.setPayload(atom: atom)
+                }
+                restoredCell.setSemanticContent(cellRecord.semanticContent.content)
+                line[column] = restoredCell
+            }
+            restoredLines.append(line)
+        }
+        let restored = Buffer.checkpointCandidate(
+            record: record,
+            columns: storage.columns,
+            rows: storage.rows,
+            tabStopWidth: tabStopWidth,
+            bidiState: bidiState,
+            lines: restoredLines
+        )
+        guard restored.semanticPromptInvariantsHold() else {
+            throw TerminalCheckpointError.invalidStructure("semantic-invariants")
+        }
+        return restored
+    }
+
+    /// 唯一 commit point。此区段不再 decode、调用 cancellation 或执行可抛错操作。candidate parser 的
+    /// closure 捕获 candidate，因而不转移 parser 对象；只把已校验的 parser value state 提交给
+    /// live parser，并保留 embedder 注册的 OSC handlers。Swift 的引用赋值和 closure 建立仍可能
+    /// 触发不可恢复的进程级 allocation failure；这里承诺的是不会返回“部分提交”的业务错误。
+    private func commitCheckpointCandidate(
+        _ candidate: Terminal,
+        storage: TerminalCheckpointStorageV1
+    ) {
+        let committedMouseMode = candidate.mouseMode
+        synchronizedOutputTimeoutItem?.cancel()
+        synchronizedOutputTimeoutItem = nil
+        synchronizedOutputActive = false
+
+        TinyAtom.release(codes: payloadCodes)
+        // CharData 只保存 TinyAtom code；`payloadCodes` 才拥有对应 atom lifetime。先释放 live
+        // terminal 的旧 ownership，再把 candidate 的完整 ownership 集合转交，并清空 candidate，
+        // 避免其 deinit 二次 release。Buffer 引用必须与这组 codes 在同一 commit 内一起替换。
+        payloadCodes = candidate.payloadCodes
+        candidate.payloadCodes.removeAll()
+        charToIndexMap = candidate.charToIndexMap
+        indexToCharMap = candidate.indexToCharMap
+        lastCharIndex = candidate.lastCharIndex
+
+        cols = candidate.cols
+        rows = candidate.rows
+        options = candidate.options
+        // Color properties 的 didSet 会通知 embedder；commit 内先抑制回调并一次转移全部
+        // palette authority，待所有 engine state 完整后再统一通知。
+        settingFgColor = true
+        settingBgColor = true
+        settingCursorColor = true
+        foregroundColor = candidate.foregroundColor
+        backgroundColor = candidate.backgroundColor
+        cursorColor = candidate.cursorColor
+        settingFgColor = false
+        settingBgColor = false
+        settingCursorColor = false
+        installedColors = candidate.installedColors
+        defaultAnsiColors = candidate.defaultAnsiColors
+        ansiColors = candidate.ansiColors
+        normalBuffer = candidate.normalBuffer
+        altBuffer = candidate.altBuffer
+        buffer = storage.activeBuffer == .normal ? normalBuffer : altBuffer
+        normalBuffer.scroll = { [weak self] wrapped in self?.scroll(isWrapped: wrapped) }
+        altBuffer.scroll = { [weak self] wrapped in self?.scroll(isWrapped: wrapped) }
+
+        applicationKeypad = candidate.applicationKeypad
+        applicationCursor = candidate.applicationCursor
+        keyboardModeNormal = candidate.keyboardModeNormal
+        keyboardModeAlt = candidate.keyboardModeAlt
+        sendFocus = candidate.sendFocus
+        cursorHidden = candidate.cursorHidden
+        cursorBlink = candidate.cursorBlink
+        originMode = candidate.originMode
+        marginMode = candidate.marginMode
+        insertMode = candidate.insertMode
+        wraparound = candidate.wraparound
+        reverseWraparound = candidate.reverseWraparound
+        bracketedPasteMode = candidate.bracketedPasteMode
+        lineFeedMode = candidate.lineFeedMode
+        smoothScroll = candidate.smoothScroll
+        cc.send8bit = candidate.cc.send8bit
+        conformance = candidate.conformance
+        xtermTitleSetUtf = candidate.xtermTitleSetUtf
+        xtermTitleSetHex = candidate.xtermTitleSetHex
+        xtermTitleQueryUtf = candidate.xtermTitleQueryUtf
+        xtermTitleQueryHex = candidate.xtermTitleQueryHex
+        mouseProtocol = candidate.mouseProtocol
+        mouseShiftCapture = candidate.mouseShiftCapture
+        hyperLinkTracking = candidate.hyperLinkTracking
+        curAttr = candidate.curAttr
+        charset = candidate.charset
+        gCharsets = candidate.gCharsets
+        gcharset = candidate.gcharset
+        gLevel = candidate.gLevel
+        currentBidiState = candidate.currentBidiState
+        bidiArrowKeySwap = candidate.bidiArrowKeySwap
+        allow80To132 = candidate.allow80To132
+        savedBidiPrivateModes = candidate.savedBidiPrivateModes
+        readingBuffer = candidate.readingBuffer
+
+        parser.initialState = candidate.parser.initialState
+        parser.currentState = candidate.parser.currentState
+        parser._osc = candidate.parser._osc
+        parser._apc = candidate.parser._apc
+        parser._pars = candidate.parser._pars
+        parser._parsTxt = candidate.parser._parsTxt
+        parser._collect = candidate.parser._collect
+        parser._parameterLimitExceeded = candidate.parser._parameterLimitExceeded
+        if let handler = candidate.parser.activeDcsHandler as? DECRQSS {
+            handler.terminal = self
+            parser.activeDcsHandler = handler
+        } else {
+            parser.activeDcsHandler = nil
+        }
+        parser.terminal = self
+
+        // `mouseMode` 的 didSet 是第一个允许外部观察的动作；必须等所有字段都提交完毕，
+        // delegate 才能观察到 committed state，不能看到 candidate 的一半状态。
+        mouseMode = committedMouseMode
+        if storage.modes.synchronizedOutput {
+            beginSynchronizedOutput()
+        }
+        // 其余 callback 同样只在 committed state 上执行；任一 callback 重入都不会越过
+        // validation/candidate/commit 的原子边界。
+        // TerminalDelegate 的默认 color setter 会把同一个值回写 Terminal；若此处不保持
+        // reentrancy gate，base16 palette strategy 会在通知阶段重建 256 色表，并静默抹掉
+        // checkpoint 中由 OSC 4 写入的动态槽位。gate 只覆盖同步 callback，返回后立即释放。
+        settingFgColor = true
+        tdel?.setForegroundColor(source: self, color: foregroundColor)
+        settingFgColor = false
+        settingBgColor = true
+        tdel?.setBackgroundColor(source: self, color: backgroundColor)
+        settingBgColor = false
+        settingCursorColor = true
+        tdel?.setCursorColor(source: self, color: cursorColor)
+        settingCursorColor = false
+        tdel?.colorChanged(source: self, idx: nil)
+        tdel?.bufferActivated(source: self)
+        cursorHidden ? tdel?.hideCursor(source: self) : tdel?.showCursor(source: self)
+        tdel?.cursorStyleChanged(source: self, newStyle: options.cursorStyle)
+        tdel?.scrolled(source: self, yDisp: buffer.yDisp)
+        refresh(startRow: 0, endRow: rows - 1)
+    }
+}
+
 // Default implementations
 public extension TerminalDelegate {
     func cursorStyleChanged (source: Terminal, newStyle: CursorStyle)

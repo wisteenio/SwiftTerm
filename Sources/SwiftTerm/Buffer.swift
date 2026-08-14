@@ -1705,3 +1705,75 @@ public final class Buffer {
         }
     }    
 }
+
+extension Buffer {
+    /// 把 OSC 133 的 object identity 转成 checkpoint-relative row。若 origin 已被 scrollback
+    /// 裁剪，就只保留 group counter/marks，不伪造新的 active origin；import 后点击会 fail closed。
+    func checkpointSemanticState(firstRetainedLine: Int) -> TerminalCheckpointBufferSemanticV1 {
+        let retainedPromptRow = semanticPromptStartRow.flatMap { row in
+            row >= firstRetainedLine ? row - firstRetainedLine : nil
+        }
+        return TerminalCheckpointBufferSemanticV1(
+            content: TerminalCheckpointSemanticContent(content: semanticContent),
+            input: TerminalCheckpointSemanticInputV1(input: semanticInput),
+            clickMode: TerminalCheckpointSemanticClickModeV1(mode: semanticClickMode),
+            usesSpecialCursorKeys: semanticUsesSpecialCursorKeys,
+            groupCounter: semanticGroupCounter,
+            activeGroupID: activeSemanticGroupID,
+            promptStartRow: retainedPromptRow
+        )
+    }
+
+    /// 从已经完整校验并完成 cell 构造的 checkpoint 建立隔离 Buffer。该 factory 只写新对象，
+    /// 因此任何 allocation 或 content 错误都不会触及 live Terminal；调用方只能在所有 Buffer
+    /// 与 parser state 都 ready 后提交对象引用。这里是 Buffer private storage 的唯一 restore
+    /// authority；后续字段必须在 DTO validation、此 factory 与 behavior Gate 三处同步，禁止让
+    /// Terminal 或 AirCLI 业务层逐个改写 `_lines/_yBase` 等私有字段。
+    static func checkpointCandidate(
+        record: TerminalCheckpointBufferV1,
+        columns: Int,
+        rows: Int,
+        tabStopWidth: Int,
+        bidiState: BidiPresentationState,
+        lines restoredLines: [BufferLine]
+    ) -> Buffer {
+        let result = Buffer(
+            cols: columns,
+            rows: rows,
+            tabStopWidth: tabStopWidth,
+            scrollback: record.scrollbackLimit,
+            bidiState: bidiState
+        )
+        for line in restoredLines {
+            result._lines.push(line)
+        }
+        result._x = record.x
+        result._y = record.y
+        result._yBase = record.yBase
+        result._yDisp = record.yDisplay
+        result.linesTop = record.linesTrimmed
+        result._scrollTop = record.scrollTop
+        result._scrollBottom = record.scrollBottom
+        result._marginLeft = record.marginLeft
+        result._marginRight = record.marginRight
+        result.tabStops = record.tabStops
+        result.savedX = record.savedX
+        result.savedY = record.savedY
+        result.savedAttr = record.savedPen.attribute.attribute
+        result.savedCharset = record.savedPen.charset
+        result.savedOriginMode = record.savedOriginMode
+        result.savedMarginMode = record.savedMarginMode
+        result.savedWraparound = record.savedWraparound
+        result.savedReverseWraparound = record.savedReverseWraparound
+        result.semanticContent = record.semantic.content.content
+        result.semanticInput = record.semantic.input.input
+        result.semanticClickMode = record.semantic.clickMode.mode
+        result.semanticUsesSpecialCursorKeys = record.semantic.usesSpecialCursorKeys
+        result.semanticGroupCounter = record.semantic.groupCounter
+        result.activeSemanticGroupID = record.semantic.activeGroupID
+        result.semanticPromptStartLine = record.semantic.promptStartRow.map { result._lines[$0] }
+        result.semanticPromptStartRowCache = record.semantic.promptStartRow ?? 0
+        result.recalculateLinesWithImagesCount()
+        return result
+    }
+}
