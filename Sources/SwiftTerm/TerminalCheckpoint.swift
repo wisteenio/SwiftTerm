@@ -73,6 +73,18 @@ private struct TerminalCheckpointHeader: Decodable {
     var version: Int
 }
 
+/// checkpoint schema 当前无法无损表达的稳定、content-free 原因。
+///
+/// 调用方可以据此区分“parser 正处于尚未完成的 unknown DCS”与已经进入 terminal state 的
+/// unsupported content；禁止依赖诊断字符串决定 retry。新增 case 是公开 checkpoint contract
+/// 变更，必须同步 Mac producer 的 retry mapping 与既有跨 engine Gate。
+public enum TerminalCheckpointUnsupportedContent: String, Sendable, Equatable {
+    case images
+    case imagesOrUnknownDCSInFlight
+    case nonStringCellPayload
+    case payloadCapacity
+}
+
 /// Checkpoint export/import 的稳定失败分类。错误不携带 terminal content。
 public enum TerminalCheckpointError: Error, Sendable, Equatable {
     case malformedEncoding
@@ -80,7 +92,7 @@ public enum TerminalCheckpointError: Error, Sendable, Equatable {
     case encodedLengthExceeded(actual: Int, maximum: Int)
     case normalScrollbackLengthExceeded(actual: Int, maximum: Int)
     case invalidStructure(String)
-    case unsupportedContent(String)
+    case unsupportedContent(TerminalCheckpointUnsupportedContent)
     case cancelled
 }
 

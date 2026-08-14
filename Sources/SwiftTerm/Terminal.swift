@@ -7928,12 +7928,12 @@ extension Terminal {
               kittyGraphicsState.placementsByKey.isEmpty,
               kittyPlacementContext == nil,
               !(parser.currentState == .apcString && parser._apc.first == UInt8(ascii: "G")) else {
-            throw TerminalCheckpointError.unsupportedContent("images")
+            throw TerminalCheckpointError.unsupportedContent(.images)
         }
         let activeDCS: TerminalCheckpointDCSV1?
         if let handler = parser.activeDcsHandler {
             guard let decrqss = handler as? DECRQSS else {
-                throw TerminalCheckpointError.unsupportedContent("images-or-unknown-dcs-in-flight")
+                throw TerminalCheckpointError.unsupportedContent(.imagesOrUnknownDCSInFlight)
             }
             activeDCS = TerminalCheckpointDCSV1(kind: .decrqss, data: decrqss.data)
         } else {
@@ -8020,7 +8020,7 @@ extension Terminal {
         isCancelled: () -> Bool
     ) throws -> TerminalCheckpointBufferV1 {
         guard !source.hasAnyImages else {
-            throw TerminalCheckpointError.unsupportedContent("images")
+            throw TerminalCheckpointError.unsupportedContent(.images)
         }
         let maximumHistory = isNormal ? TerminalCheckpoint.maximumNormalScrollbackLines : 0
         let retainedCount = min(source.lines.count, rows + maximumHistory)
@@ -8037,7 +8037,7 @@ extension Terminal {
                 let payload: String?
                 if let target = cell.getPayload() {
                     guard let string = target as? String else {
-                        throw TerminalCheckpointError.unsupportedContent("non-string-cell-payload")
+                        throw TerminalCheckpointError.unsupportedContent(.nonStringCellPayload)
                     }
                     payload = string
                 } else {
@@ -8342,7 +8342,7 @@ extension Terminal {
                 var restoredCell = cell
                 if let payload = cellRecord.stringPayload {
                     guard let atom = makePayload(value: payload) else {
-                        throw TerminalCheckpointError.unsupportedContent("payload-capacity")
+                        throw TerminalCheckpointError.unsupportedContent(.payloadCapacity)
                     }
                     restoredCell.setPayload(atom: atom)
                 }
