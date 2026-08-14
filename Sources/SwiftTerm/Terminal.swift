@@ -7901,9 +7901,9 @@ private final class TerminalCheckpointCandidateDelegate: TerminalDelegate {
     func send(source: Terminal, data: ArraySlice<UInt8>) {}
 }
 
-// Checkpoint engine implementation intentionally stays in Terminal.swift. It needs private Terminal
-// state to produce one coherent snapshot; widening those fields to internal/fileprivate for a separate
-// file would create exactly the private-field seam that AirCLI #125 forbids business code to depend on.
+// Checkpoint engine 刻意保留在 Terminal.swift：只有这里能在不扩大可见性的前提下读取全部
+// Terminal private state 并形成一个一致快照。若为了拆文件把字段改成 internal/fileprivate，
+// 就会产生 AirCLI #125 明确禁止业务层依赖的 private-field seam。
 extension Terminal {
     /// 导出当前 engine 的结构化 checkpoint。调用者必须在拥有 Terminal 的串行执行上下文调用；
     /// normal scrollback 会先按 2,000 个逻辑行和 2 MiB history payload 双上限裁剪，图片及
@@ -7939,6 +7939,9 @@ extension Terminal {
         var normal = try checkpointBuffer(normalBuffer, isNormal: true, isCancelled: isCancelled)
         try trimNormalHistoryToByteLimit(&normal, isCancelled: isCancelled)
         let alternate = try checkpointBuffer(altBuffer, isNormal: false, isCancelled: isCancelled)
+        let activeBufferRemovedLines = isCurrentBufferAlternate
+            ? max(0, altBuffer.lines.count - alternate.lines.count)
+            : max(0, normalBuffer.lines.count - normal.lines.count)
         let storage = TerminalCheckpointStorageV1(
             version: TerminalCheckpoint.schemaVersion,
             columns: cols,
@@ -7946,7 +7949,7 @@ extension Terminal {
             activeBuffer: isCurrentBufferAlternate ? .alternate : .normal,
             normal: normal,
             alternate: alternate,
-            modes: checkpointModes(),
+            modes: checkpointModes(activeBufferRemovedLines: activeBufferRemovedLines),
             palette: TerminalCheckpointPaletteV1(
                 strategy: TerminalCheckpointPaletteStrategyV1(strategy: options.ansi256PaletteStrategy),
                 installed: installedColors.map(TerminalCheckpointColorV1.init(color:)),
@@ -7977,8 +7980,9 @@ extension Terminal {
     ///
     /// 状态转换只有 `validating -> ready(candidate) -> committed`：decode/validation 已由 envelope
     /// 完成，本方法把所有 cell、Buffer 与 mode 构造到隔离 candidate，并在 cancellation gate 后
-    /// 进入不返回业务错误的 commit 区段。任何 validation、allocation、unsupported content 或
-    /// cancel 都只销毁 candidate，live Terminal 保持逐字段不变；进入 commit 后不再检查 cancel。
+    /// 进入不返回业务错误的 commit 区段。任何 commit 前可报告的 validation、candidate 构造、
+    /// unsupported content 或 cancel 错误都只销毁 candidate，live Terminal 保持逐字段不变；
+    /// 进入 commit 后不再检查 cancel。进程级 allocation failure 不属于可恢复的业务错误。
     ///
     /// #57 的 consumer 必须先停止向同一个 Terminal 喂增量 output，在其唯一串行 owner 上调用本
     /// 方法，成功返回后才从 checkpoint offset 之后继续 feed。import 会采用 checkpoint 的 grid
@@ -8143,7 +8147,7 @@ extension Terminal {
         }
     }
 
-    private func checkpointModes() -> TerminalCheckpointModesV1 {
+    private func checkpointModes(activeBufferRemovedLines: Int) -> TerminalCheckpointModesV1 {
         TerminalCheckpointModesV1(
             applicationKeypad: applicationKeypad,
             applicationCursor: applicationCursor,
@@ -8173,10 +8177,15 @@ extension Terminal {
             mouseMode: TerminalCheckpointMouseModeV1(mode: mouseMode),
             mouseProtocol: TerminalCheckpointMouseProtocolV1(protocol: mouseProtocol),
             mouseShiftCapture: mouseShiftCapture,
-            activeHyperlink: hyperLinkTracking.map {
-                TerminalCheckpointHyperlinkV1(
+            // hyperlink start 使用 active Buffer 的 absolute line index。normal history 的行数和
+            // byte 双裁剪都会改变 checkpoint 内的相对坐标；起点仍在保留后缀时必须同步平移，
+            // 起点已经被裁掉时则失效该 tracking。保留旧坐标会让合法 export 自己过不了 schema
+            // validation，或让恢复后的 OSC 8 terminator 给错误行写 payload。
+            activeHyperlink: hyperLinkTracking.flatMap {
+                guard $0.start.row >= activeBufferRemovedLines else { return nil }
+                return TerminalCheckpointHyperlinkV1(
                     column: $0.start.col,
-                    row: $0.start.row,
+                    row: $0.start.row - activeBufferRemovedLines,
                     payload: $0.payload
                 )
             },

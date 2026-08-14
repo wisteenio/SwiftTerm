@@ -88,6 +88,8 @@ final class TerminalCheckpointTests {
         for line in 0..<2_100 {
             source.feed(text: "line-\(line)\r\n")
         }
+        let hyperlink = "https://www.aircli.app/checkpoint"
+        source.feed(text: "\(esc)]8;;\(hyperlink)\u{7}linked-tail")
         let checkpoint = try source.exportCheckpoint()
         let (restored, _) = TerminalTestHarness.makeTerminal(cols: 2, rows: 1, scrollback: 0)
         try restored.importCheckpoint(checkpoint)
@@ -95,6 +97,18 @@ final class TerminalCheckpointTests {
         #expect(restored.normalBuffer.lines.count <= 4 + TerminalCheckpoint.maximumNormalScrollbackLines)
         #expect(restored.normalBuffer.scrollback == TerminalCheckpoint.maximumNormalScrollbackLines)
         #expect(restored.altBuffer.lines.count == 4)
+
+        // OSC 8 tracking 的 row 来自裁剪前 live Buffer；checkpoint 必须把它平移到被 2 MiB
+        // byte cap 保留的 history 后缀。关闭 sequence 后 payload 应落到相同的保留行，而非因
+        // stale absolute row 越界、拒绝合法 export，或静默标记另一行。
+        let tracking = try #require(restored.hyperLinkTracking)
+        let trackedStart = tracking.start
+        #expect(trackedStart.row == restored.buffer.yBase + restored.buffer.y)
+        restored.feed(text: "\(esc)]8;;\u{7}")
+        #expect(
+            restored.buffer.lines[trackedStart.row][trackedStart.col].getPayload() as? String
+                == tracking.payload
+        )
 
         let (empty, _) = TerminalTestHarness.makeTerminal(cols: 20, rows: 4, scrollback: 64)
         let emptyCheckpoint = try empty.exportCheckpoint()
@@ -129,6 +143,21 @@ final class TerminalCheckpointTests {
         let invalidWideCell = try JSONSerialization.data(withJSONObject: json)
         #expect(throws: TerminalCheckpointError.invalidStructure("wide-cell-leading")) {
             try TerminalCheckpoint(encodedBytes: invalidWideCell)
+        }
+
+        // `.csiParam` 的数字 fast path 会直接写 `parameters.last`；空数组虽可被 Codable
+        // 解出，却不是 live parser 可产生的状态，必须在 import 之前拒绝。
+        var invalidParser = try #require(
+            JSONSerialization.jsonObject(with: checkpoint.encodedBytes()) as? [String: Any]
+        )
+        var parser = try #require(invalidParser["parser"] as? [String: Any])
+        parser["currentState"] = ParserState.csiParam.rawValue
+        parser["parameters"] = []
+        parser["parameterText"] = []
+        invalidParser["parser"] = parser
+        let invalidParserBytes = try JSONSerialization.data(withJSONObject: invalidParser)
+        #expect(throws: TerminalCheckpointError.invalidStructure("parser")) {
+            try TerminalCheckpoint(encodedBytes: invalidParserBytes)
         }
 
         let oversized = Data(repeating: 0, count: TerminalCheckpoint.maximumEncodedBytes + 1)

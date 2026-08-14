@@ -592,17 +592,33 @@ struct TerminalCheckpointParserV1: Codable, Sendable {
 
     func validate() throws {
         guard ParserState(rawValue: initialState) != nil,
-              ParserState(rawValue: currentState) != nil,
+              let currentState = ParserState(rawValue: currentState),
               osc.count <= 64 * 1024,
               apc.count <= 64 * 1024,
+              !parameters.isEmpty,
               parameters.count <= EscapeSequenceParser.maximumParameterCount,
+              parameters.allSatisfy({ (0...EscapeSequenceParser.maximumParameterValue).contains($0) }),
+              parameterText.count == parameters.count - 1,
+              parameterText.allSatisfy({ $0 == UInt8(ascii: ";") || $0 == UInt8(ascii: ":") }),
               parameterText.count <= 512,
               collect.count <= 64,
               pendingUTF8.count <= 4 else {
             throw TerminalCheckpointError.invalidStructure("parser")
         }
+
+        // `_pars` 在 parser reset/clear 后也必须至少保留 `[0]`；`.csiParam` 的数字 fast path
+        // 会直接写最后一个元素。separator text 与 value slots 必须一一对应，且参数溢出只可能
+        // 在第 24 个 slot 已占满后发生。若让损坏值进入 live parser，下一 byte 可能越界或产生
+        // 一个正常 feed 永远无法构造的 transition，因此必须在 candidate 构造前整体拒绝。
+        guard !parameterLimitExceeded || parameters.count == EscapeSequenceParser.maximumParameterCount else {
+            throw TerminalCheckpointError.invalidStructure("parser-parameters")
+        }
+        guard currentState == .oscString || osc.isEmpty,
+              currentState == .apcString || apc.isEmpty else {
+            throw TerminalCheckpointError.invalidStructure("parser-string-state")
+        }
         if let activeDCS {
-            guard currentState == ParserState.dcsPassthrough.rawValue else {
+            guard currentState == .dcsPassthrough else {
                 throw TerminalCheckpointError.invalidStructure("dcs-state")
             }
             try activeDCS.validate()
