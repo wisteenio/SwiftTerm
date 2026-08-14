@@ -505,6 +505,7 @@ struct TerminalCheckpointModesV1: Codable, Sendable {
               keyboardAlternateStack.allSatisfy({ $0 & ~KittyKeyboardFlags.knownMask == 0 }),
               charsets.count == 4,
               (0..<charsets.count).contains(activeCharset),
+              Int(charsetLevel) < charsets.count,
               Set(savedBidiPrivateModes.keys).isSubset(of: [1243, 2500, 2501]) else {
             throw TerminalCheckpointError.invalidStructure("modes")
         }
@@ -631,7 +632,22 @@ struct TerminalCheckpointParserV1: Codable, Sendable {
     var activeDCS: TerminalCheckpointDCSV1?
 
     func validate() throws {
-        guard ParserState(rawValue: initialState) != nil,
+        // putback 只可能由 print fast path 在一个 2...4 byte UTF-8 sequence 尚未收齐时产生。
+        // 空值代表没有 pending scalar；非空值必须以合法 lead byte 开头且严格短于期望长度。
+        // 只检查 `count <= 4` 会接受 `[ASCII]` 或完整 sequence，并在下一次正常 output 前注入
+        // checkpoint 自造的 bytes。尾部暂不要求 continuation，因为 live 分块也可能在发现坏尾字节
+        // 之前先因长度不足 putback，下一 chunk 才按现有 malformed-input policy 消费。
+        let pendingUTF8IsValid: Bool
+        if let first = pendingUTF8.first {
+            let expectedByteCount = UnicodeUtil.expectedSizeFromFirstByte(first)
+            pendingUTF8IsValid = (2...4).contains(expectedByteCount)
+                && pendingUTF8.count < expectedByteCount
+        } else {
+            pendingUTF8IsValid = true
+        }
+        // `initialState` 是 parser reset 的固定返回点，production engine 从未提供改变它的命令；
+        // 允许任意 enum 值会让损坏 checkpoint 改写未来 reset 语义，形成 live feed 不可达状态。
+        guard initialState == ParserState.ground.rawValue,
               let currentState = ParserState(rawValue: currentState),
               osc.count <= 64 * 1024,
               apc.count <= 64 * 1024,
@@ -642,7 +658,7 @@ struct TerminalCheckpointParserV1: Codable, Sendable {
               parameterText.allSatisfy({ $0 == UInt8(ascii: ";") || $0 == UInt8(ascii: ":") }),
               parameterText.count <= 512,
               collect.count <= 64,
-              pendingUTF8.count <= 4 else {
+              pendingUTF8IsValid else {
             throw TerminalCheckpointError.invalidStructure("parser")
         }
 

@@ -160,6 +160,22 @@ final class TerminalCheckpointTests {
             try TerminalCheckpoint(encodedBytes: invalidParserBytes)
         }
 
+        // parser.initialState 的 production authority 永远是 ground；pendingUTF8 又只能是尚未
+        // 收齐的 2...4-byte scalar 前缀。若接受其他 enum 或 ASCII putback，下一次 feed 会执行
+        // live parser 永远无法产生的 reset／字节注入。
+        var mutatedInitialState = checkpoint.storage
+        mutatedInitialState.parser.initialState = ParserState.escape.rawValue
+        #expect(throws: TerminalCheckpointError.invalidStructure("parser")) {
+            try TerminalCheckpoint(encodedBytes: JSONEncoder().encode(mutatedInitialState))
+        }
+        for pendingUTF8 in [[UInt8(ascii: "A")], [0xC2, 0xA0]] {
+            var invalidPendingUTF8 = checkpoint.storage
+            invalidPendingUTF8.parser.pendingUTF8 = pendingUTF8
+            #expect(throws: TerminalCheckpointError.invalidStructure("parser")) {
+                try TerminalCheckpoint(encodedBytes: JSONEncoder().encode(invalidPendingUTF8))
+            }
+        }
+
         // 结构校验本身也必须对任意解码 Int 是 total 的；不得在准备拒绝损坏 payload 时
         // 先因 `yBase + rows` 溢出。`linesTrimmed` 又会被正常 scroll 递增，不能让 Int.max
         // commit 后把下一次 output 变成 trap。
@@ -186,6 +202,13 @@ final class TerminalCheckpointTests {
         multipleCharacterCharset.modes.charsets[0] = [UInt8(ascii: "A"): "AB"]
         #expect(throws: TerminalCheckpointError.invalidStructure("charset")) {
             try TerminalCheckpoint(encodedBytes: JSONEncoder().encode(multipleCharacterCharset))
+        }
+        // gLevel 只由 locking-shift commands 设为 0...3。越界值会让后续 setgCharset 不再
+        // 更新 active charset，造成恢复后才出现的 renderer divergence。
+        var invalidCharsetLevel = checkpoint.storage
+        invalidCharsetLevel.modes.charsetLevel = .max
+        #expect(throws: TerminalCheckpointError.invalidStructure("modes")) {
+            try TerminalCheckpoint(encodedBytes: JSONEncoder().encode(invalidCharsetLevel))
         }
 
         let oversized = Data(repeating: 0, count: TerminalCheckpoint.maximumEncodedBytes + 1)
