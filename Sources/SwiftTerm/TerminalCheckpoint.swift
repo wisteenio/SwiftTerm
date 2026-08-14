@@ -149,6 +149,10 @@ struct TerminalCheckpointBufferV1: Codable, Sendable {
     /// engine 理论上累积越界，export 必须 fail closed，不能 clamp。未来扩大此域前，必须先把
     /// normal/alternate Buffer 内全部 savedY 加减法改成 total arithmetic，禁止只放宽此 guard。
     private static let deferredSavedCursorYRange = Int(Int32.min)...Int(Int32.max)
+    /// `linesTrimmed` 会在每次 history 淘汰时继续 `+= 1`。V1 只接受 Int32 的非负域，既能
+    /// 表达超过二十亿行的累计值，又在 64-bit production runtime 留出充足增长 headroom；
+    /// 禁止接受 `Int.max` 之类会让下一次正常 scroll 触发溢出的 checkpoint。
+    private static let maximumSerializedLinesTrimmed = Int(Int32.max)
 
     var lines: [TerminalCheckpointLineV1]
     var scrollbackLimit: Int?
@@ -203,13 +207,15 @@ struct TerminalCheckpointBufferV1: Codable, Sendable {
         guard (0..<rows).contains(y) else {
             throw TerminalCheckpointError.invalidStructure("cursor-y")
         }
-        guard yBase >= 0, yBase + rows <= lines.count else {
+        // `yBase` 来自不可信 JSON；必须用已经证明非负的差值比较，不能先计算
+        // `yBase + rows`，否则 Int.max 会让验证器本身在返回 error 前 trap。
+        guard yBase >= 0, yBase <= lines.count - rows else {
             throw TerminalCheckpointError.invalidStructure("buffer-base")
         }
         guard yDisplay >= 0, yDisplay <= yBase else {
             throw TerminalCheckpointError.invalidStructure("buffer-display")
         }
-        guard linesTrimmed >= 0 else {
+        guard (0...Self.maximumSerializedLinesTrimmed).contains(linesTrimmed) else {
             throw TerminalCheckpointError.invalidStructure("lines-trimmed")
         }
         guard (0..<rows).contains(scrollTop),
@@ -433,11 +439,18 @@ struct TerminalCheckpointPenV1: Codable, Sendable {
 
     func validate() throws {
         try attribute.validate()
-        if let charset {
-            guard charset.count <= 256,
-                  charset.values.allSatisfy({ $0.utf8.count <= 16 }) else {
-                throw TerminalCheckpointError.invalidStructure("charset")
-            }
+        try Self.validateCharset(charset)
+    }
+
+    /// Charset map 会被 Terminal 的 byte fast path 直接以 `String.first` 读取。checkpoint 必须
+    /// 在 commit 前证明每个 replacement 恰好是一个非空 `Character`；只限制 UTF-8 byte 数会
+    /// 让空串在后续普通 output 上 trap，也会让多 Character 值静默丢尾。此 helper 是 saved pen、
+    /// current pen 与四个 G0...G3 map 的单一校验 seam，新增 charset owner 时必须复用。
+    static func validateCharset(_ charset: [UInt8: String]?) throws {
+        guard let charset else { return }
+        guard charset.count <= 256,
+              charset.values.allSatisfy({ $0.count == 1 && $0.utf8.count <= 16 }) else {
+            throw TerminalCheckpointError.invalidStructure("charset")
         }
     }
 }
@@ -496,6 +509,9 @@ struct TerminalCheckpointModesV1: Codable, Sendable {
             throw TerminalCheckpointError.invalidStructure("modes")
         }
         try currentPen.validate()
+        for charset in charsets {
+            try TerminalCheckpointPenV1.validateCharset(charset)
+        }
         try bidi.validate()
         try activeHyperlink?.validate(columns: columns, activeLineCount: activeLineCount)
     }

@@ -160,6 +160,34 @@ final class TerminalCheckpointTests {
             try TerminalCheckpoint(encodedBytes: invalidParserBytes)
         }
 
+        // 结构校验本身也必须对任意解码 Int 是 total 的；不得在准备拒绝损坏 payload 时
+        // 先因 `yBase + rows` 溢出。`linesTrimmed` 又会被正常 scroll 递增，不能让 Int.max
+        // commit 后把下一次 output 变成 trap。
+        var overflowingBase = checkpoint.storage
+        overflowingBase.normal.yBase = Int.max
+        #expect(throws: TerminalCheckpointError.invalidStructure("buffer-base")) {
+            try TerminalCheckpoint(encodedBytes: JSONEncoder().encode(overflowingBase))
+        }
+        var exhaustedLineCounter = checkpoint.storage
+        exhaustedLineCounter.normal.linesTrimmed = Int.max
+        #expect(throws: TerminalCheckpointError.invalidStructure("lines-trimmed")) {
+            try TerminalCheckpoint(encodedBytes: JSONEncoder().encode(exhaustedLineCounter))
+        }
+
+        // Charset replacement 是后续 byte feed 的直接 engine state。active pen 空串会让
+        // `String.first` trap；G0...G3 的多 Character 值则会静默丢尾。saved/current/registered
+        // maps 必须复用 exact-one-Character validation，不能只验证当前 active map。
+        var emptyActiveCharset = checkpoint.storage
+        emptyActiveCharset.modes.currentPen.charset = [UInt8(ascii: "A"): ""]
+        #expect(throws: TerminalCheckpointError.invalidStructure("charset")) {
+            try TerminalCheckpoint(encodedBytes: JSONEncoder().encode(emptyActiveCharset))
+        }
+        var multipleCharacterCharset = checkpoint.storage
+        multipleCharacterCharset.modes.charsets[0] = [UInt8(ascii: "A"): "AB"]
+        #expect(throws: TerminalCheckpointError.invalidStructure("charset")) {
+            try TerminalCheckpoint(encodedBytes: JSONEncoder().encode(multipleCharacterCharset))
+        }
+
         let oversized = Data(repeating: 0, count: TerminalCheckpoint.maximumEncodedBytes + 1)
         #expect(throws: TerminalCheckpointError.encodedLengthExceeded(
             actual: oversized.count,
