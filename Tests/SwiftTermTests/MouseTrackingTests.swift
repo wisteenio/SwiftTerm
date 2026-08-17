@@ -734,6 +734,41 @@ struct MouseTrackingTests {
         #expect(flags == 64)
     }
 
+    @Test func x10MouseModeReportsButtonPressWithoutRelease() {
+        let (terminal, delegate) = TerminalTestHarness.makeTerminal()
+        terminal.feed(text: "\(esc)[?9h\(esc)[?1006h")
+        delegate.clearSentData()
+
+        #expect(terminal.mouseMode.sendButtonPress())
+        #expect(!terminal.mouseMode.sendButtonRelease())
+
+        if terminal.mouseMode.sendButtonPress() {
+            let press = terminal.encodeButton(
+                button: 0,
+                release: false,
+                shift: false,
+                meta: false,
+                control: false
+            )
+            terminal.sendEvent(buttonFlags: press, x: 2, y: 3, pixelX: 2, pixelY: 3)
+        }
+        if terminal.mouseMode.sendButtonRelease() {
+            let release = terminal.encodeButton(
+                button: 0,
+                release: true,
+                shift: false,
+                meta: false,
+                control: false
+            )
+            terminal.sendEvent(buttonFlags: release, x: 2, y: 3, pixelX: 2, pixelY: 3)
+        }
+
+        #expect(delegate.userMouseInputData.count == 1)
+        if let press = delegate.userMouseInputData.first {
+            #expect(String(bytes: press, encoding: .utf8) == "\(esc)[<0;3;4M")
+        }
+    }
+
     @Test func allNonOffMouseModesForwardScrollEvents() {
         let forwardingModes: [Terminal.MouseMode] = [.x10, .vt200, .buttonEventTracking, .anyEvent]
         for mode in forwardingModes {
