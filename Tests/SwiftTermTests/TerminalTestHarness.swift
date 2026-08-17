@@ -3,6 +3,7 @@ import Testing
 
 final class TerminalTestDelegate: TerminalDelegate {
     private(set) var sentData: [[UInt8]] = []
+    private(set) var userMouseInputData: [[UInt8]] = []
     private(set) var bufferActivatedCount = 0
     var cellSizeInPixelsValue: (width: Int, height: Int)? = nil
 
@@ -21,8 +22,14 @@ final class TerminalTestDelegate: TerminalDelegate {
         sentData.append(Array(data))
     }
 
+    func sendUserMouseInput(source: Terminal, data: ArraySlice<UInt8>) {
+        userMouseInputData.append(Array(data))
+        send(source: source, data: data)
+    }
+
     func clearSentData() {
         sentData.removeAll()
+        userMouseInputData.removeAll()
     }
 
     func cellSizeInPixels(source: Terminal) -> (width: Int, height: Int)? {

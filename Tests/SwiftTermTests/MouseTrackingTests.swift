@@ -771,6 +771,35 @@ struct MouseTrackingTests {
         #expect(terminal.mouseMode == .off)
     }
 
+    @Test func userMouseInputUsesDedicatedDelegatePath() {
+        let (terminal, delegate) = TerminalTestHarness.makeTerminal()
+        terminal.feed(text: "\(esc)[?1000h\(esc)[?1006h")
+        delegate.clearSentData()
+
+        terminal.feed(text: "\(esc)[5n")
+        let buttonFlags = terminal.encodeButton(
+            button: 0,
+            release: false,
+            shift: false,
+            meta: false,
+            control: false
+        )
+        terminal.sendEvent(
+            buttonFlags: buttonFlags,
+            x: 2,
+            y: 3,
+            pixelX: 2,
+            pixelY: 3
+        )
+
+        #expect(delegate.sentData.count == 2)
+        #expect(delegate.userMouseInputData.count == 1)
+        #expect(String(bytes: delegate.sentData[0], encoding: .utf8) == "\(esc)[0n")
+        if let mouseInput = delegate.userMouseInputData.first {
+            #expect(String(bytes: mouseInput, encoding: .utf8) == "\(esc)[<0;3;4M")
+        }
+    }
+
     @Test func scrollUpSendEventProducesSgrOutput() {
         let (terminal, delegate) = TerminalTestHarness.makeTerminal()
         terminal.feed(text: "\(esc)[?1000h")

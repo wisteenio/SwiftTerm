@@ -1083,8 +1083,16 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             return
         }
         let gesture = UIPanGestureRecognizer (target: self, action: #selector(panMouseHandler))
+        gesture.minimumNumberOfTouches = 1
+        gesture.maximumNumberOfTouches = 1
         addGestureRecognizer(gesture)
         panMouseGesture = gesture
+    }
+
+    /// Host 若把单指 gesture 暂时交给 selection，可禁用已经安装的 mouse pan，而不改变
+    /// Terminal 的 mouse mode 或移除 recognizer。再次启用只恢复同一 recognizer owner。
+    public func setMousePanGestureRecognitionEnabled(_ isEnabled: Bool) {
+        panMouseGesture?.isEnabled = isEnabled
     }
     
     func disableMousePanGesture () {
@@ -1101,6 +1109,8 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             return
         }
         let gesture = UIPanGestureRecognizer (target: self, action: #selector(panSelectionHandler))
+        gesture.minimumNumberOfTouches = 1
+        gesture.maximumNumberOfTouches = 1
         addGestureRecognizer(gesture)
         self.panSelectionGesture = gesture
     }
@@ -1472,6 +1482,11 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     
     open func send(source: Terminal, data: ArraySlice<UInt8>) {
         terminalDelegate?.send (source: self, data: data)
+    }
+
+    /// 与 parser 自动应答分离的用户 mouse input；host 可只转发本入口并继续过滤 ``send``。
+    open func sendUserMouseInput(source: Terminal, data: ArraySlice<UInt8>) {
+        terminalDelegate?.send(source: self, data: data)
     }
     
     /**

@@ -73,6 +73,13 @@ public protocol TerminalDelegate: AnyObject {
      * documentation, this is the "host")
      */
     func send (source: Terminal, data: ArraySlice<UInt8>)
+
+    /**
+     * Sends bytes produced by an explicit user mouse action. Hosts that filter terminal-generated
+     * responses must keep this source distinct so mouse-aware applications still receive input.
+     * The default implementation preserves the historical behavior by forwarding to ``send``.
+     */
+    func sendUserMouseInput(source: Terminal, data: ArraySlice<UInt8>)
     
     // callbacks
     
@@ -6058,6 +6065,12 @@ open class Terminal {
      */
     public func sendResponse (_ items: Any ...)
     {
+        let buffer = serializeResponse(items)
+        tdel?.send (source: self, data: buffer[...])
+    }
+
+    private func serializeResponse(_ items: [Any]) -> [UInt8]
+    {
         var buffer: [UInt8] = []
         
         for item in items {
@@ -6071,7 +6084,15 @@ open class Terminal {
                 log ("Do not know how to handle type \(item)")
             }
         }
-        tdel?.send (source: self, data: buffer[...])
+        return buffer
+    }
+
+    /// 用户触发的 mouse report 必须与 parser 自动应答保持可区分；否则需要丢弃自动应答的
+    /// host 只能连同真实 mouse input 一并丢弃。
+    private func sendUserMouseInput(_ items: Any ...)
+    {
+        let buffer = serializeResponse(items)
+        tdel?.sendUserMouseInput(source: self, data: buffer[...])
     }
     
 #if DEBUG
@@ -6884,26 +6905,26 @@ open class Terminal {
         //print ("got \(mouseProtocol)")
         switch mouseProtocol {
         case .x10:
-            sendResponse(cc.CSI, "M", [UInt8(min(buttonFlags+32, 255)), UInt8(min(32 + x+1, 255)), UInt8(min(32+y+1, 255))])
+            sendUserMouseInput(cc.CSI, "M", [UInt8(min(buttonFlags+32, 255)), UInt8(min(32 + x+1, 255)), UInt8(min(32+y+1, 255))])
         case .sgr:
             let isRelease = (buttonFlags & 3) == 3 && (buttonFlags & 32) == 0
             let bflags : Int = isRelease ? (buttonFlags & ~3) : buttonFlags
             let m = isRelease ? "m" : "M"
-            sendResponse(cc.CSI, "<\(bflags);\(x+1);\(y+1)\(m)")
+            sendUserMouseInput(cc.CSI, "<\(bflags);\(x+1);\(y+1)\(m)")
         case .sgrPixel:
             let isRelease = (buttonFlags & 3) == 3 && (buttonFlags & 32) == 0
             let bflags : Int = isRelease ? (buttonFlags & ~3) : buttonFlags
             let m = isRelease ? "m" : "M"
-            sendResponse(cc.CSI, "<\(bflags);\(pixelX);\(pixelY)\(m)")
+            sendUserMouseInput(cc.CSI, "<\(bflags);\(pixelX);\(pixelY)\(m)")
             
         case .urxvt:
-            sendResponse(cc.CSI, "\(buttonFlags+32);\(x+1);\(y+1)M");
+            sendUserMouseInput(cc.CSI, "\(buttonFlags+32);\(x+1);\(y+1)M");
         case .utf8:
             var buffer: [UInt8] = [UInt8 (ascii: "M")]
             encodeMouseUtf(data: &buffer, ch: buttonFlags+32)
             encodeMouseUtf (data: &buffer, ch: x+33)
             encodeMouseUtf (data: &buffer, ch: y+33)
-            sendResponse(cc.CSI, buffer)
+            sendUserMouseInput(cc.CSI, buffer)
         }
     }
     
@@ -8493,6 +8514,10 @@ extension Terminal {
 
 // Default implementations
 public extension TerminalDelegate {
+    func sendUserMouseInput(source: Terminal, data: ArraySlice<UInt8>) {
+        send(source: source, data: data)
+    }
+
     func cursorStyleChanged (source: Terminal, newStyle: CursorStyle)
     {
         // Do nothing
