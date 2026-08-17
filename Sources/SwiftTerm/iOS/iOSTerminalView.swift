@@ -1476,7 +1476,10 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     var lineLeading: CGFloat = 0
     
     open func bufferActivated(source: Terminal) {
-        resetManualScrollTracking()
+        // `Terminal` 的 yDisp 是 viewport anchor authority；buffer activation 只允许把该事实
+        // 投影到 UIScrollView，禁止反向把 engine 强制推进 live tail。checkpoint import、normal/
+        // alternate 切换都会经过这里，覆盖 yDisp 会让恢复后的历史阅读位置不可逆丢失。
+        synchronizeManualScrollTrackingFromTerminal()
         updateScroller ()
     }
     
@@ -1660,6 +1663,13 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         if !enabled {
             manualScrollOffsetWithinRow = 0
         }
+    }
+
+    private func synchronizeManualScrollTrackingFromTerminal() {
+        let displayBuffer = terminal.displayBuffer
+        let isReadingHistory = displayBuffer.yDisp < maxDisplayRow(in: displayBuffer)
+        manualScrollOffsetWithinRow = 0
+        setManualScrolling(isReadingHistory)
     }
 
     func resetManualScrollOffsetWithinRow() {
