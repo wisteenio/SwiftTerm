@@ -339,6 +339,10 @@ open class Terminal {
     /// Terminal configuration options.
     /// Setup(isReset:) method should be called to apply changes
     public var options: TerminalOptions
+
+    /// Binds prepared checkpoint state to this exact live engine. The identifier is process-local,
+    /// opaque outside SwiftTerm, and never substitutes for a transcript or transport identity.
+    private let checkpointMaterializationOwnerID = UUID()
     
     // Selection services attached to this terminal.  Held weakly: the views own
     // them.  They are notified when lines are shifted in place so they can
@@ -8001,37 +8005,69 @@ extension Terminal {
         return try TerminalCheckpoint(storage: storage)
     }
 
-    /// 原子导入 `TerminalCheckpoint`。
+    /// Atomically imports a `TerminalCheckpoint` on the caller's current serial executor.
     ///
-    /// 状态转换只有 `validating -> ready(candidate) -> committed`：decode/validation 已由 envelope
-    /// 完成，本方法把所有 cell、Buffer 与 mode 构造到隔离 candidate，并在 cancellation gate 后
-    /// 进入不返回业务错误的 commit 区段。任何 commit 前可报告的 validation、candidate 构造、
-    /// unsupported content 或 cancel 错误都只销毁 candidate，live Terminal 保持逐字段不变；
-    /// 进入 commit 后不再检查 cancel。进程级 allocation failure 不属于可恢复的业务错误。
-    ///
-    /// #57 的 consumer 必须先停止向同一个 Terminal 喂增量 output，在其唯一串行 owner 上调用本
-    /// 方法，成功返回后才从 checkpoint offset 之后继续 feed。import 会采用 checkpoint 的 grid
-    /// dimensions，但不会发送 `sizeChanged`：恢复既有 Host geometry 不是 Mobile 发起新的 PTY
-    /// resize。所有 delegate 通知都发生在完整 commit 之后，因此 renderer 看不到半恢复状态。
-    ///
-    /// 后续 schema 扩展必须沿固定顺序增加：V1 DTO + `validate` -> candidate 构造 -> 此处唯一 commit
-    /// -> fixed/random cut Gate；禁止在 decode/validation 阶段直接写 live Terminal。
+    /// This compatibility entry point performs the same prepare/commit split exposed below. Every
+    /// fallible decode, validation, candidate construction, unsupported-content, and cancellation
+    /// check precedes the single non-throwing engine commit. The caller must fence incremental feed
+    /// until this method returns; delegate notifications observe only fully committed state.
     public func importCheckpoint(
         _ checkpoint: TerminalCheckpoint,
         isCancelled: () -> Bool = { false }
     ) throws {
         if isCancelled() { throw TerminalCheckpointError.cancelled }
+        let context = checkpointMaterializationContext()
+        let materialization = try Self.prepareCheckpointMaterialization(
+            checkpoint,
+            context: context,
+            isCancelled: isCancelled
+        )
+        if isCancelled() { throw TerminalCheckpointError.cancelled }
+        try commitCheckpointMaterialization(materialization)
+    }
 
+    /// Captures only the immutable construction values needed by a background materializer.
+    /// The caller must invoke this on the live Terminal's owner executor after fencing feed.
+    public func checkpointMaterializationContext() -> TerminalCheckpointMaterializationContext {
+        TerminalCheckpointMaterializationContext(
+            ownerID: checkpointMaterializationOwnerID,
+            options: options
+        )
+    }
+
+    /// Builds and semantically validates an isolated candidate without accessing a live Terminal.
+    /// Cancellation is checked throughout construction; every error destroys only the candidate.
+    public static func prepareCheckpointMaterialization(
+        _ checkpoint: TerminalCheckpoint,
+        context: TerminalCheckpointMaterializationContext,
+        isCancelled: () -> Bool = { false }
+    ) throws -> TerminalCheckpointMaterialization {
+        if isCancelled() { throw TerminalCheckpointError.cancelled }
         let storage = checkpoint.storage
         let candidateDelegate = TerminalCheckpointCandidateDelegate()
-        var candidateOptions = options
+        var candidateOptions = context.options
         candidateOptions.cols = storage.columns
         candidateOptions.rows = storage.rows
         candidateOptions.scrollback = storage.normal.scrollbackLimit ?? 0
         let candidate = Terminal(delegate: candidateDelegate, options: candidateOptions)
         try candidate.prepareCheckpointCandidate(storage, isCancelled: isCancelled)
-
         if isCancelled() { throw TerminalCheckpointError.cancelled }
+        return TerminalCheckpointMaterialization(
+            ownerID: context.ownerID,
+            candidate: candidate,
+            storage: storage
+        )
+    }
+
+    /// Consumes one exact prepared candidate and performs the sole live-engine commit.
+    /// The owner mismatch and single-use checks happen before state transfer; after consumption the
+    /// commit performs no decode, cancellation callback, or recoverable throwing operation.
+    public func commitCheckpointMaterialization(
+        _ materialization: TerminalCheckpointMaterialization
+    ) throws {
+        let (candidate, storage) = try materialization.consume(
+            ownerID: checkpointMaterializationOwnerID
+        )
         commitCheckpointCandidate(candidate, storage: storage)
     }
 

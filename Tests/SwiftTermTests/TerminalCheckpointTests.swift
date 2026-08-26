@@ -6,6 +6,35 @@ import Testing
 final class TerminalCheckpointTests {
     private let esc = "\u{1b}"
 
+    /// Candidate construction may run on a worker, but only the exact live Terminal that issued
+    /// the opaque context may consume the prepared state. Preparation never mutates live state,
+    /// and the successful commit is a single-use transfer.
+    @Test func preparedMaterializationCommitsOnceToItsExactTerminal() async throws {
+        let (source, _) = TerminalTestHarness.makeTerminal(cols: 24, rows: 6, scrollback: 32)
+        source.feed(text: "prepared checkpoint 🙂\r\nsecond line")
+        let checkpoint = try source.exportCheckpoint()
+
+        let (live, _) = TerminalTestHarness.makeTerminal(cols: 12, rows: 3, scrollback: 4)
+        live.feed(text: "live state must survive preparation")
+        let beforePreparation = try live.exportCheckpoint().encodedBytes()
+        let context = live.checkpointMaterializationContext()
+
+        let prepared = try await Task.detached {
+            try Terminal.prepareCheckpointMaterialization(checkpoint, context: context)
+        }.value
+        #expect(try live.exportCheckpoint().encodedBytes() == beforePreparation)
+
+        let (sibling, _) = TerminalTestHarness.makeTerminal(cols: 12, rows: 3, scrollback: 4)
+        #expect(throws: TerminalCheckpointError.materializationOwnerMismatch) {
+            try sibling.commitCheckpointMaterialization(prepared)
+        }
+        try live.commitCheckpointMaterialization(prepared)
+        assertEquivalentBehavior(source, live)
+        #expect(throws: TerminalCheckpointError.materializationAlreadyConsumed) {
+            try live.commitCheckpointMaterialization(prepared)
+        }
+    }
+
     /// 固定反例覆盖 UTF-8、OSC、DCS 与重复 unit 边界；其后 500 个确定性随机切点
     /// 覆盖 parser/mode/cell 组合。探针不读取 checkpoint schema，只比较 engine 行为。
     @Test func fixedAndRandomByteCutsResumeEquivalentBehavior() throws {

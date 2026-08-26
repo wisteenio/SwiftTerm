@@ -93,7 +93,57 @@ public enum TerminalCheckpointError: Error, Sendable, Equatable {
     case normalScrollbackLengthExceeded(actual: Int, maximum: Int)
     case invalidStructure(String)
     case unsupportedContent(TerminalCheckpointUnsupportedContent)
+    case materializationOwnerMismatch
+    case materializationAlreadyConsumed
     case cancelled
+}
+
+/// An opaque, immutable snapshot of the live Terminal's candidate-construction configuration.
+///
+/// The Terminal owner captures this value only after fencing incremental feed. It may then cross
+/// executors to checkpoint preparation without transferring the live Terminal itself. The context
+/// contains no delegate, renderer, cursor, Session, or transport authority.
+public struct TerminalCheckpointMaterializationContext: @unchecked Sendable {
+    let ownerID: UUID
+    let options: TerminalOptions
+}
+
+/// A fully validated Terminal candidate that can be transferred back to one exact live Terminal.
+///
+/// Candidate construction may run on any serial worker. The contained engine is inaccessible to
+/// callers and can be consumed exactly once by the Terminal that issued the matching context.
+/// Dropping an uncommitted value releases the candidate without touching live state.
+public final class TerminalCheckpointMaterialization: @unchecked Sendable {
+    private enum State {
+        case ready(
+            ownerID: UUID,
+            candidate: Terminal,
+            storage: TerminalCheckpointStorageV1
+        )
+        case consumed
+    }
+
+    private let lock = NSLock()
+    private var state: State
+
+    init(ownerID: UUID, candidate: Terminal, storage: TerminalCheckpointStorageV1) {
+        state = .ready(ownerID: ownerID, candidate: candidate, storage: storage)
+    }
+
+    func consume(ownerID: UUID) throws -> (Terminal, TerminalCheckpointStorageV1) {
+        lock.lock()
+        defer { lock.unlock() }
+        switch state {
+        case .ready(let expectedOwnerID, let candidate, let storage):
+            guard expectedOwnerID == ownerID else {
+                throw TerminalCheckpointError.materializationOwnerMismatch
+            }
+            state = .consumed
+            return (candidate, storage)
+        case .consumed:
+            throw TerminalCheckpointError.materializationAlreadyConsumed
+        }
+    }
 }
 
 /// V1 的完整 engine state。该类型及其子类型只属于 SwiftTerm module；AirCLI 业务层只能持有
