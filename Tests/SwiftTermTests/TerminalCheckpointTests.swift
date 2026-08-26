@@ -35,6 +35,17 @@ final class TerminalCheckpointTests {
         }
     }
 
+    /// Descriptor owners can fence an opaque checkpoint against their separately authenticated
+    /// grid without decoding engine-private storage or touching a live Terminal.
+    @Test func checkpointMatchesOnlyItsExactContentFreeGeometry() throws {
+        let (source, _) = TerminalTestHarness.makeTerminal(cols: 24, rows: 6, scrollback: 32)
+        let checkpoint = try source.exportCheckpoint()
+
+        #expect(checkpoint.matchesGeometry(columns: 24, rows: 6))
+        #expect(!checkpoint.matchesGeometry(columns: 23, rows: 6))
+        #expect(!checkpoint.matchesGeometry(columns: 24, rows: 5))
+    }
+
     /// 固定反例覆盖 UTF-8、OSC、DCS 与重复 unit 边界；其后 500 个确定性随机切点
     /// 覆盖 parser/mode/cell 组合。探针不读取 checkpoint schema，只比较 engine 行为。
     @Test func fixedAndRandomByteCutsResumeEquivalentBehavior() throws {

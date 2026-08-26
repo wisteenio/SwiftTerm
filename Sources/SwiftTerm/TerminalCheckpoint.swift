@@ -67,6 +67,14 @@ public struct TerminalCheckpoint: Sendable {
     public func encodedBytes() -> Data {
         bytes
     }
+
+    /// Compares the decoded engine grid with a separately authenticated descriptor grid.
+    ///
+    /// The result exposes no cell, parser, cursor, mode, or scrollback state. Descriptor owners use
+    /// it before candidate construction so a mismatched opaque payload cannot mutate a live engine.
+    public func matchesGeometry(columns: Int, rows: Int) -> Bool {
+        storage.columns == columns && storage.rows == rows
+    }
 }
 
 private struct TerminalCheckpointHeader: Decodable {
